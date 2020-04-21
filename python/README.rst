@@ -23,7 +23,7 @@ To write 3 values:
 
 We are counting, so pypi.org will have a count of 2.
 
-To read 2 values:
+To read 2 values, it is almost like writing but ``writer`` became ``reader`` and we ``fetch`` data to iterate on:
 
 .. code-block:: python
 
