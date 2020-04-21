@@ -4,7 +4,11 @@ class Connection(object):
         self.port = port
         self.apikey = apikey
         self.verify = verify
+        self.warnings_disabled = False
 
+    def disable_ssl_warnings(self):
+        self.warnings_disabled = True
+        
     def get_host(self):
         return self.host
     

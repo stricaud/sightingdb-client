@@ -6,6 +6,10 @@ class SDBWrite:
         self.con = connection
         self.items = {"items": []}
 
+        if self.con.warnings_disabled:
+            from requests.packages.urllib3.exceptions import InsecureRequestWarning
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+        
     def add(self, namespace, value, timestamp=0):
         if namespace[0] == "/":
             namespace = namespace[1:]
@@ -17,6 +21,7 @@ class SDBWrite:
         return r.text
 
     def write_one(self, namespace, value, timestamp=0):
+        self.items["items"] = []
         self.add(namespace, value, timestamp)
         return self.commit()
 
