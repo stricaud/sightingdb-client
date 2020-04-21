@@ -16,6 +16,7 @@ setup(name="sightingdb",
       author_email=about["__author_email__"],
       description=about["__description__"],
       long_description=textwrap.dedent(open("README.rst", "r").read()),
+      long_description_content_type="text/x-rst"
       maintainer=about["__maintainer__"],
       maintainer_email=about["__maintainer_email__"],
       url=about["__url__"],
