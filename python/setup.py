@@ -7,8 +7,8 @@ import textwrap
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
 about = {}
-with open(os.path.join(current_dir, "sightingdb", "__version__.py", "r") as f:
-          exec(f.read(), about)
+with open(os.path.join(current_dir, "sightingdb", "__version__.py"), "r") as fp:
+          exec(fp.read(), about)
 
 setup(name="sightingdb",
       version=about["__version__"],
