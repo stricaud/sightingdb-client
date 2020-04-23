@@ -35,6 +35,7 @@ class SDBRead:
         """
         r = requests.post("https://%s:%d/rb" % (self.con.host, self.con.port), headers={"content-type": "application/json","Authorization": self.con.apikey},
                          data = json.dumps(self.items), verify=self.con.verify)
+        self.items["items"] = []
         return json.loads(r.text)["items"]
 
     def fetch_with_stats(self):

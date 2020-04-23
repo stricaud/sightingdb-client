@@ -34,6 +34,7 @@ class SDBWrite:
         """
         r = requests.post("https://%s:%d/wb" % (self.con.host, self.con.port), headers={"content-type": "application/json","Authorization": self.con.apikey},
                          data = json.dumps(self.items), verify=self.con.verify)
+        self.items["items"] = []
         return r.text
 
     def write_one(self, namespace, value, timestamp=0):
