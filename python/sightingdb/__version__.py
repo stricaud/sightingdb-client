@@ -2,7 +2,7 @@
 
 __description__ = "The Python Client Library for SightingDB"
 __url__ = "https://www.github.com/stricaud/sightingdb-client"
-__version__ = "0.0.6"
+__version__ = "1.0.0"
 __author__ = "Sebastien Tricaud"
 __author_email__ = "sebastien@honeynet.org"
 __license__ = "MIT"

@@ -1,0 +1,19 @@
+# Copy to ~/.sightingdb/client.toml (or point SIGHTINGDB_CONFIG at it).
+# Every setting here can be overridden by a SIGHTINGDB_* environment variable,
+# and by whatever the program passes to the client itself.
+
+[client]
+url = "https://localhost:9999"
+apikey = "changeme"
+
+# TLS: true verifies certificates, false skips verification, or name the
+# certificate to trust — SightingDB's self-signed one lives in
+# ~/.sightingdb/ssl/cert.pem.
+verify = true
+
+# Seconds before a request is given up on.
+timeout = 10.0
+
+# Retries for requests that failed in a way a retry could fix. Writes are only
+# retried when the connection was never established, so nothing counts twice.
+max_retries = 2

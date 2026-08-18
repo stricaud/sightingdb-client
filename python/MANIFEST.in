@@ -1,0 +1,7 @@
+# The sdist carries what is needed to check the package out and test it, so a
+# distribution rebuilt from PyPI can be verified without cloning the repository.
+include LICENSE
+include README.md
+recursive-include tests *.py
+recursive-include samples *.py
+global-exclude __pycache__/* *.py[cod]

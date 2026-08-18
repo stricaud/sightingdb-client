@@ -1,0 +1,63 @@
+[build-system]
+# 77 is where the SPDX `license = "MIT"` expression and `license-files` became
+# valid metadata, replacing the deprecated License:: classifiers.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sightingdb-client"
+dynamic = ["version"]
+description = "The Python Client Library for SightingDB"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sebastien Tricaud", email = "sebastien@honeynet.org" }]
+maintainers = [{ name = "Sebastien Tricaud", email = "sebastien@honeynet.org" }]
+keywords = ["sightingdb", "sightings", "threat-intelligence", "security"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.24",
+    "tomli>=1.1.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+]
+
+[project.urls]
+Homepage = "https://github.com/stricaud/sightingdb-client"
+Source = "https://github.com/stricaud/sightingdb-client"
+Server = "https://github.com/stricaud/sightingdb"
+
+[tool.setuptools]
+packages = ["sightingdb"]
+
+[tool.setuptools.dynamic]
+version = { attr = "sightingdb.__version__.__version__" }
+
+[tool.setuptools.package-data]
+sightingdb = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live: talks to a real SightingDB server; needs SIGHTINGDB_TEST_URL",
+]

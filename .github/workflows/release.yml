@@ -1,0 +1,271 @@
+name: Release Python client
+
+# Publishes python/ to PyPI and cuts a GitHub Release when a version tag is
+# pushed:
+#
+#     git tag python-v1.0.1 && git push origin python-v1.0.1
+#
+# Tagging is all that is needed. If sightingdb/__version__.py disagrees with
+# the tag, this workflow bumps it, commits, and moves the tag onto that commit
+# before building — so the version on PyPI is always one a commit contains.
+# Plain `v1.0.1` works too, while Python is the only client in this repository.
+#
+# Setup, once: PyPI > Your account > Publishing > add a pending publisher for
+# the project `sightingdb-client`, this repository, workflow `release.yml`,
+# environment `pypi`. It is a *pending* publisher until the first release,
+# because the project does not exist on PyPI until this workflow creates it.
+# No token is stored anywhere; PyPI hands this workflow a short-lived one over
+# OIDC. See the note at the bottom for the API-token alternative.
+
+on:
+  push:
+    tags:
+      - 'python-v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  # The version bump, the tag and the release all happen in this one run. They
+  # cannot be split across workflows: a tag pushed with GITHUB_TOKEN does not
+  # trigger a new workflow run. Dispatch is here for releasing without tagging
+  # by hand.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without a leading v (e.g. 1.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: the tag must agree with the package, and the tests must pass.
+  # ---------------------------------------------------------------------------
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    permissions:
+      # This job may commit the version bump and move the tag onto it.
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history and credentials retained, for the bump and the tag move.
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Resolve the version
+        id: resolve
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION#v}"
+            prefix="python-v"
+          else
+            # Accept python-v1.2.3 and v1.2.3, and keep the prefix that was used
+            # so the tag this run produces is the one that was pushed.
+            case "$GITHUB_REF_NAME" in
+              python-v*) prefix="python-v" ;;
+              *)         prefix="v" ;;
+            esac
+            version="${GITHUB_REF_NAME#$prefix}"
+          fi
+
+          # PEP 440: 1.2.3, and the pre/post/dev spellings pip understands.
+          if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([._-]?(a|b|c|rc|alpha|beta|post|dev)[0-9]*)?$'; then
+            echo "::error::'$version' is not a version like 1.2.3 or 1.2.3rc1"
+            exit 1
+          fi
+
+          file="python/sightingdb/__version__.py"
+          declared="$(grep -oE '^__version__ = "[^"]*"' "$file" | cut -d'"' -f2)"
+          echo "requested=$version  __version__.py=$declared"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "$version" = "$declared" ]; then
+            echo "The package already says $version; nothing to bump"
+            echo "tag=$prefix$version" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bring the package up to the requested version and move the tag onto
+          # the commit that contains it. A version on PyPI that no commit holds
+          # is what this avoids.
+          git fetch --quiet origin "$DEFAULT_BRANCH"
+
+          if [ "$EVENT" = "push" ]; then
+            # Only safe when the tag is on the branch tip. Anywhere else,
+            # committing the bump would release something other than what was
+            # tagged.
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$DEFAULT_BRANCH")" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME is not on the tip of $DEFAULT_BRANCH, so the \
+          version cannot be bumped for it. Tag a commit on $DEFAULT_BRANCH, or set __version__ \
+          in $file to $version first."
+              exit 1
+            fi
+          fi
+
+          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+          perl -0pi -e 's/^__version__ = "[^"]*"/__version__ = "'"$version"'"/m' "$file"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$file"
+          git commit -m "Release Python client $version"
+          git tag -f "$prefix$version"
+          git push origin "$DEFAULT_BRANCH"
+          git push --force origin "refs/tags/$prefix$version"
+
+          echo "Bumped to $version and moved $prefix$version onto the commit that contains it"
+          echo "tag=$prefix$version" >> "$GITHUB_OUTPUT"
+
+      # A tag can point at a commit that never went through CI, so the tests run
+      # here too rather than being assumed.
+      - name: Install
+        working-directory: python
+        run: pip install -e '.[dev]'
+
+      - name: Test
+        working-directory: python
+        run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  # The distribution, built once and used by both the publish and the release.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check the metadata
+        working-directory: python
+        run: twine check --strict dist/*
+
+      # The tag decides what is published, so the artifact has to carry that
+      # exact version. A mismatch here means the bump did not take.
+      - name: Confirm the artifact matches the tag
+        working-directory: python
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          if [ ! -f "dist/sightingdb_client-$VERSION.tar.gz" ]; then
+            echo "::error::dist/ does not hold sightingdb_client-$VERSION.tar.gz"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: python/dist/*
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # PyPI. A release cannot be undone, only yanked.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    # Named in PyPI's trusted-publisher configuration. Add required reviewers to
+    # this environment (Settings > Environments) to gate publishing behind an
+    # approval; GitHub creates it on first use if it is missing.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sightingdb-client
+    permissions:
+      # The OIDC token PyPI exchanges for a short-lived upload token.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ---------------------------------------------------------------------------
+  # The GitHub Release, kept last so a PyPI hiccup does not leave a release
+  # pointing at a version nobody can install.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [check, build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+          # Full history so the generated notes can see the previous tag.
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS && cd ..
+
+          # 1.0.0rc1 and friends are prereleases; 1.0.0 is not.
+          case "$VERSION" in
+            *a*|*b*|*rc*|*dev*|*alpha*|*beta*) prerelease=--prerelease ;;
+            *)                                 prerelease= ;;
+          esac
+
+          gh release create "$TAG" \
+            --title "Python client $VERSION" \
+            --generate-notes \
+            $prerelease \
+            dist/*
+
+# ---------------------------------------------------------------------------
+# API-token alternative to Trusted Publishing
+#
+# If OIDC is not an option, create a PyPI API token scoped to the sightingdb-client
+# project (https://pypi.org/manage/account/token/), add it as the repository
+# secret PYPI_API_TOKEN, drop the `id-token: write` permission, and give the
+# publish step:
+#
+#   with:
+#     password: ${{ secrets.PYPI_API_TOKEN }}
+#
+# Trusted Publishing is preferred: nothing long-lived is stored, and a leaked
+# workflow log cannot hand anyone upload rights.
+# ---------------------------------------------------------------------------

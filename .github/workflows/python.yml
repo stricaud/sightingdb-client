@@ -1,0 +1,172 @@
+name: Python
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The unit tests need no server: httpx.MockTransport stands in for one.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test on Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, and the current release.
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: python -m pip install --upgrade pip && pip install -e '.[dev]'
+
+      - name: Test
+        run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Against a real SightingDB. The client is only worth anything if it agrees
+  # with the server, and every bug this library has had was a disagreement the
+  # mocks could not have caught.
+  # ---------------------------------------------------------------------------
+  live:
+    name: Test against SightingDB
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the client
+        working-directory: python
+        run: pip install -e '.[dev]'
+
+      # The prebuilt Linux binary from the server's own releases, rather than a
+      # cargo build: this job is here to check agreement with a released
+      # server, and downloading one takes seconds where building takes minutes.
+      - name: Fetch the latest SightingDB release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download --repo stricaud/sightingdb \
+            --pattern '*x86_64-unknown-linux-gnu.tar.gz' --dir /tmp/sdb
+          tar xzf /tmp/sdb/*.tar.gz -C /tmp/sdb --strip-components=1
+          /tmp/sdb/sightingdb --version
+
+      - name: Start it
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sdb/db
+          cat > /tmp/sdb/sightingdb.toml <<'TOML'
+          [daemon]
+          listen_ip = "127.0.0.1"
+          listen_port = 9999
+          authenticate = true
+          daemonize = false
+          ssl = true
+          ssl_cert = "/tmp/sdb/cert.pem"
+          ssl_key = "/tmp/sdb/key.pem"
+          dbdir = "/tmp/sdb/db"
+
+          [acl]
+          "changeme" = "rw, admin"
+          TOML
+
+          cat > /tmp/sdb/log4rs.yml <<'YAML'
+          refresh_rate: 30 seconds
+          appenders:
+            stdout:
+              kind: console
+          root:
+            level: info
+            appenders:
+              - stdout
+          YAML
+
+          /tmp/sdb/sightingdb -c /tmp/sdb/sightingdb.toml --install-selfsigned-keys
+          /tmp/sdb/sightingdb -c /tmp/sdb/sightingdb.toml -l /tmp/sdb/log4rs.yml &
+
+          # Wait for the port rather than sleeping a guessed number of seconds.
+          for _ in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:9999/i > /dev/null; then
+              echo "SightingDB is up: $(curl -sk https://127.0.0.1:9999/i)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::SightingDB did not start listening on 9999"
+          exit 1
+
+      - name: Live tests
+        working-directory: python
+        env:
+          SIGHTINGDB_TEST_URL: https://127.0.0.1:9999
+          SIGHTINGDB_TEST_APIKEY: changeme
+          SIGHTINGDB_TEST_VERIFY: "false"
+        run: pytest -q -m live
+
+  # ---------------------------------------------------------------------------
+  # The distribution itself: built, checked, and installed from the artifact
+  # rather than from the source tree, since that is what a user gets.
+  # ---------------------------------------------------------------------------
+  package:
+    name: Build the distribution
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check the metadata
+        run: twine check --strict dist/*
+
+      - name: Install the wheel and import it
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install dist/*.whl
+          # From /tmp, so the source tree on this runner cannot satisfy the import.
+          cd /tmp && /tmp/fresh/bin/python -c "
+          import sightingdb
+          print(sightingdb.__version__, sightingdb.SightingDB)
+          "
+
+  # Workflow shell is not covered by pytest and only fails when a release is
+  # already under way, so it gets its own check.
+  workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: pip install pyyaml
+      - name: Check for unbound shell variables
+        run: python3 .github/lint-workflows.py
