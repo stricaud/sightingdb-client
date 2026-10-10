@@ -86,16 +86,53 @@ class Config:
     """
 
     url: str = DEFAULT_URL
+    #: Every server to talk to. One entry is the ordinary case — a node, or a
+    #: load balancer that fans out on the client's behalf. Several make the
+    #: client do the fanning out itself: writes to all of them, reads to one.
+    urls: tuple[str, ...] = ()
     apikey: str | None = None
     verify: bool | str = True
     timeout: float = 10.0
     max_retries: int = 2
+    #: What a fanned-out write is counted for on every node it reaches.
+    #:
+    #: Only used when there is more than one URL. Without it each node would
+    #: count the same write under its own name, and the counts would add
+    #: together when the nodes synced. Defaults to this machine's hostname.
+    node_id: str | None = None
 
     def __post_init__(self) -> None:
-        url = self.url.rstrip("/")
-        if "://" not in url:
-            url = f"https://{url}"
-        object.__setattr__(self, "url", url)
+        # `urls` is the real list and `url` is its first entry, so anything
+        # reading `config.url` — a repr, an error message, a caller written
+        # before this existed — still gets something true.
+        given = self.urls or (self.url,)
+        normalised = tuple(_normalise_url(one) for one in given if str(one).strip())
+        if not normalised:
+            raise ConfigurationError("No server URL was given")
+
+        seen: list[str] = []
+        for one in normalised:
+            # The same server twice would be written to twice, which counts
+            # twice. Worth dropping rather than trusting the caller.
+            if one not in seen:
+                seen.append(one)
+        object.__setattr__(self, "urls", tuple(seen))
+        object.__setattr__(self, "url", seen[0])
+
+        if self.node_id is not None:
+            node_id = self.node_id.strip()
+            if not node_id:
+                raise ConfigurationError("node_id cannot be empty")
+            if len(node_id) > 64:
+                raise ConfigurationError(
+                    f"node_id must be 64 characters or fewer, got {len(node_id)}"
+                )
+            if not all(c.isalnum() or c in "-_." for c in node_id):
+                raise ConfigurationError(
+                    "node_id may use letters, digits, '-', '_' and '.' only, "
+                    f"got {node_id!r}"
+                )
+            object.__setattr__(self, "node_id", node_id)
         if self.timeout <= 0:
             raise ConfigurationError(f"timeout must be positive, got {self.timeout!r}")
         if self.max_retries < 0:
@@ -112,8 +149,15 @@ class Config:
         found: dict[str, Any] = {}
 
         url = env.get(f"{_ENV_PREFIX}URL")
+        urls = env.get(f"{_ENV_PREFIX}URLS")
         host = env.get(f"{_ENV_PREFIX}HOST")
-        if url:
+        if urls:
+            # Comma separated, because an environment variable cannot hold a
+            # list and a comma is what everything else uses for one.
+            found["urls"] = tuple(
+                one.strip() for one in urls.split(",") if one.strip()
+            )
+        elif url:
             found["url"] = url
         elif host:
             port = env.get(f"{_ENV_PREFIX}PORT")
@@ -126,6 +170,8 @@ class Config:
 
         if (apikey := env.get(f"{_ENV_PREFIX}APIKEY")) is not None:
             found["apikey"] = apikey
+        if (node_id := env.get(f"{_ENV_PREFIX}NODE_ID")) is not None:
+            found["node_id"] = node_id
         if (verify := env.get(f"{_ENV_PREFIX}VERIFY")) is not None:
             found["verify"] = _as_verify(verify, f"{_ENV_PREFIX}VERIFY")
         if (timeout := env.get(f"{_ENV_PREFIX}TIMEOUT")) is not None:
@@ -171,7 +217,12 @@ class Config:
             raise ConfigurationError(f"{target}: [client] must be a table")
 
         found: dict[str, Any] = {}
-        if "url" in section:
+        if "urls" in section:
+            listed = section["urls"]
+            if not isinstance(listed, (list, tuple)):
+                raise ConfigurationError(f"{target}: urls must be a list")
+            found["urls"] = tuple(str(one) for one in listed)
+        elif "url" in section:
             found["url"] = str(section["url"])
         elif "host" in section:
             found["url"] = _build_url(
@@ -183,6 +234,8 @@ class Config:
             )
         if "apikey" in section:
             found["apikey"] = str(section["apikey"])
+        if "node_id" in section:
+            found["node_id"] = str(section["node_id"])
         if "verify" in section:
             found["verify"] = _as_verify(section["verify"], f"{target}: verify")
         if "timeout" in section:
@@ -200,6 +253,7 @@ class Config:
         cls,
         *,
         url: str | None = None,
+        urls: Any = None,
         host: str | None = None,
         port: int | None = None,
         ssl: bool | None = None,
@@ -207,6 +261,7 @@ class Config:
         verify: bool | str | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
+        node_id: str | None = None,
         config_file: str | os.PathLike[str] | None = None,
         use_env: bool = True,
         use_file: bool = True,
@@ -214,6 +269,8 @@ class Config:
         """Build a config from arguments, environment and file, in that order."""
         if url and host:
             raise ConfigurationError("Pass either url= or host=, not both")
+        if urls and (url or host):
+            raise ConfigurationError("Pass either urls= or url=/host=, not both")
 
         settings: dict[str, Any] = {}
         if use_file or config_file is not None:
@@ -222,7 +279,15 @@ class Config:
             settings.update(cls.env_settings())
 
         explicit: dict[str, Any] = {}
-        if url:
+        if urls:
+            listed = tuple(str(one) for one in urls)
+            if not listed:
+                raise ConfigurationError("urls= was empty")
+            explicit["urls"] = listed
+            # A list given here replaces whatever single URL a file or the
+            # environment supplied, rather than being merged with it.
+            settings.pop("url", None)
+        elif url:
             explicit["url"] = url
         elif host:
             explicit["url"] = _build_url(host, port, ssl)
@@ -239,7 +304,14 @@ class Config:
             explicit["timeout"] = float(timeout)
         if max_retries is not None:
             explicit["max_retries"] = int(max_retries)
+        if node_id is not None:
+            explicit["node_id"] = node_id
         settings.update(explicit)
+
+        # A list from any source wins over a single URL from a lower-priority
+        # one, for the same reason: the two describe different intentions.
+        if "urls" in settings and "url" in settings and "url" not in explicit:
+            settings.pop("url")
 
         unknown = set(settings) - {f.name for f in cls.__dataclass_fields__.values()}
         if unknown:  # pragma: no cover - defensive
@@ -256,6 +328,14 @@ class Config:
             f"Config(url={self.url!r}, apikey={key}, verify={self.verify!r}, "
             f"timeout={self.timeout!r}, max_retries={self.max_retries!r})"
         )
+
+
+def _normalise_url(url: Any) -> str:
+    """A URL with a scheme and no trailing slash."""
+    text = str(url).strip().rstrip("/")
+    if "://" not in text:
+        text = f"https://{text}"
+    return text
 
 
 def _build_url(host: str, port: int | None, ssl: bool | None) -> str:

@@ -10,9 +10,10 @@ from typing import Any, Iterable, Iterator, Sequence
 import httpx
 
 from . import _protocol as proto
+from . import _routing as routing
 from .__version__ import __version__
 from .config import Config
-from .errors import BulkWriteError, NotFoundError, SightingDBError
+from .errors import BulkWriteError, NotFoundError, SightingDBError, TransportError
 from .models import Attribute, BulkWriteResult, ReadResult, ServerInfo, Sighting
 
 __all__ = ["SightingDB", "WriteBatch"]
@@ -74,6 +75,7 @@ class SightingDB:
         self,
         url: str | None = None,
         *,
+        urls: Iterable[str] | None = None,
         host: str | None = None,
         port: int | None = None,
         ssl: bool | None = None,
@@ -81,6 +83,7 @@ class SightingDB:
         verify: bool | str | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
+        node_id: str | None = None,
         config: Config | None = None,
         config_file: str | None = None,
         use_env: bool = True,
@@ -90,6 +93,7 @@ class SightingDB:
     ) -> None:
         self.config = config or Config.resolve(
             url=url,
+            urls=tuple(urls) if urls is not None else None,
             host=host,
             port=port,
             ssl=ssl,
@@ -97,13 +101,16 @@ class SightingDB:
             verify=verify,
             timeout=timeout,
             max_retries=max_retries,
+            node_id=node_id,
             config_file=config_file,
             use_env=use_env,
             use_file=use_file,
         )
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(
-            base_url=self.config.url,
+            # No base_url: with more than one server the URL is chosen per
+            # request, so it is given in full each time. With one server this
+            # is the same thing said differently.
             headers=self._headers(),
             verify=self.config.verify,
             timeout=self.config.timeout,
@@ -115,6 +122,21 @@ class SightingDB:
         if self.config.apikey is not None:
             headers["authorization"] = self.config.apikey
         return headers
+
+    @property
+    def urls(self) -> tuple[str, ...]:
+        """Every server this client talks to."""
+        return self.config.urls
+
+    @property
+    def fans_out(self) -> bool:
+        """Whether this client is spreading writes itself.
+
+        ``False`` when it points at one address — which may well be a load
+        balancer doing the same job on the server side. Nothing about the API
+        differs either way; this is here to be asked, not to be acted on.
+        """
+        return len(self.config.urls) > 1
 
     # -- lifecycle -------------------------------------------------------
 
@@ -130,6 +152,10 @@ class SightingDB:
         self.close()
 
     def __repr__(self) -> str:
+        if self.fans_out:
+            return f"<SightingDB {len(self.config.urls)} servers: " + ", ".join(
+                self.config.urls
+            ) + ">"
         return f"<SightingDB {self.config.url}>"
 
     # -- writing ---------------------------------------------------------
@@ -301,14 +327,93 @@ class SightingDB:
     # -- transport -------------------------------------------------------
 
     def _send(self, request: proto.Request) -> Any:
+        if not self.fans_out:
+            return self._send_to(self.config.urls[0], request)
+        if request.idempotent:
+            return self._read_from_one(request)
+        return self._write_to_all(request)
+
+    def _write_to_all(self, request: proto.Request) -> Any:
+        """Send a write to every server, and answer with the first that took it.
+
+        Every server, because a write that reached only one is one the others
+        have to catch up — and catching up is repair rather than the normal
+        path. One server refusing is not a lost sighting though: the one that
+        took it is what the others converge from. What must never happen is
+        reporting success when *no* server took it.
+        """
+        answered: Any = None
+        first_error: Exception | None = None
+        reached = 0
+
+        for url in self.config.urls:
+            try:
+                result = self._send_to(url, request, origin=self._origin())
+            except Exception as exc:  # noqa: BLE001 - re-raised below if total
+                if first_error is None:
+                    first_error = exc
+                continue
+            reached += 1
+            if answered is None:
+                # The first server's count, which is that server's own view —
+                # the only thing any single server can honestly report.
+                answered = result
+
+        if reached == 0:
+            assert first_error is not None
+            raise first_error
+        return answered
+
+    def _read_from_one(self, request: proto.Request) -> Any:
+        """Read from the server that owns this value, falling back if it is down.
+
+        Owned by hash, so a value always comes from the same place: servers
+        drift apart transiently while they catch up with each other, and two
+        consecutive reads served by different ones can otherwise show a count
+        going down.
+        """
+        key = request.value or request.namespace
+        order = routing.order_for(self.config.urls, key)
+
+        first_error: Exception | None = None
+        for url in order:
+            try:
+                return self._send_to(url, request)
+            except TransportError as exc:
+                # Unreachable: try the next. Anything else — a refusal, a
+                # missing value — is this server's real answer and is not
+                # improved by asking someone else.
+                if first_error is None:
+                    first_error = exc
+                continue
+        assert first_error is not None
+        raise first_error
+
+    def _origin(self) -> str:
+        return self.config.node_id or routing.default_node_id()
+
+    def _send_to(
+        self, url: str, request: proto.Request, *, origin: str | None = None
+    ) -> Any:
         max_retries = self.config.max_retries
+        headers: dict[str, str] | None = None
+        if origin is not None:
+            # Every server counts this write under one name. Without it each
+            # would count it under its own, and the counts would add together
+            # when the servers synced — see sightingdb._routing.
+            headers = {
+                routing.ORIGIN_HEADER: origin,
+                routing.HOPS_HEADER: str(routing.DEFAULT_HOPS),
+            }
+
         for attempt in itertools.count():
             try:
                 response = self._http.request(
                     request.method,
-                    request.path,
+                    f"{url}{request.path}",
                     params=request.params or None,
                     json=request.json,
+                    headers=headers,
                 )
             except httpx.HTTPError as exc:
                 if attempt < max_retries and proto.retry_after_exception(
@@ -317,7 +422,7 @@ class SightingDB:
                     time.sleep(proto.backoff(attempt))
                     continue
                 raise proto.transport_error(
-                    exc, request, f"{self.config.url}{request.path}"
+                    exc, request, f"{url}{request.path}"
                 ) from exc
 
             if attempt < max_retries and proto.retry_after_status(

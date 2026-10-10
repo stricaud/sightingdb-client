@@ -10,9 +10,10 @@ from typing import Any, Iterable
 import httpx
 
 from . import _protocol as proto
+from . import _routing as routing
 from ._client import USER_AGENT, _chunks
 from .config import Config
-from .errors import BulkWriteError, NotFoundError, SightingDBError
+from .errors import BulkWriteError, NotFoundError, SightingDBError, TransportError
 from .models import Attribute, BulkWriteResult, ReadResult, ServerInfo, Sighting
 
 __all__ = ["AsyncSightingDB", "AsyncWriteBatch"]
@@ -40,6 +41,7 @@ class AsyncSightingDB:
         self,
         url: str | None = None,
         *,
+        urls: Iterable[str] | None = None,
         host: str | None = None,
         port: int | None = None,
         ssl: bool | None = None,
@@ -47,6 +49,7 @@ class AsyncSightingDB:
         verify: bool | str | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
+        node_id: str | None = None,
         config: Config | None = None,
         config_file: str | None = None,
         use_env: bool = True,
@@ -56,6 +59,7 @@ class AsyncSightingDB:
     ) -> None:
         self.config = config or Config.resolve(
             url=url,
+            urls=tuple(urls) if urls is not None else None,
             host=host,
             port=port,
             ssl=ssl,
@@ -63,13 +67,15 @@ class AsyncSightingDB:
             verify=verify,
             timeout=timeout,
             max_retries=max_retries,
+            node_id=node_id,
             config_file=config_file,
             use_env=use_env,
             use_file=use_file,
         )
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(
-            base_url=self.config.url,
+            # No base_url: with more than one server the URL is chosen per
+            # request. With one server this is the same thing said differently.
             headers=self._headers(),
             verify=self.config.verify,
             timeout=self.config.timeout,
@@ -96,6 +102,12 @@ class AsyncSightingDB:
         await self.aclose()
 
     def __repr__(self) -> str:
+        if self.fans_out:
+            return (
+                f"<AsyncSightingDB {len(self.config.urls)} servers: "
+                + ", ".join(self.config.urls)
+                + ">"
+            )
         return f"<AsyncSightingDB {self.config.url}>"
 
     # -- writing ---------------------------------------------------------
@@ -209,15 +221,97 @@ class AsyncSightingDB:
 
     # -- transport -------------------------------------------------------
 
+    @property
+    def urls(self) -> tuple[str, ...]:
+        """Every server this client talks to."""
+        return self.config.urls
+
+    @property
+    def fans_out(self) -> bool:
+        """Whether this client is spreading writes itself.
+
+        ``False`` when it points at one address — which may well be a load
+        balancer doing the same job on the server side.
+        """
+        return len(self.config.urls) > 1
+
     async def _send(self, request: proto.Request) -> Any:
+        if not self.fans_out:
+            return await self._send_to(self.config.urls[0], request)
+        if request.idempotent:
+            return await self._read_from_one(request)
+        return await self._write_to_all(request)
+
+    async def _write_to_all(self, request: proto.Request) -> Any:
+        """Send a write to every server, and answer with the first that took it.
+
+        Sent together rather than one after another, which is most of the point
+        of the asynchronous client: the slowest server sets the pace instead of
+        the sum of them all.
+
+        See :mod:`sightingdb._routing` for why they all carry one origin.
+        """
+        origin = self.config.node_id or routing.default_node_id()
+        results = await asyncio.gather(
+            *(self._send_to(url, request, origin=origin) for url in self.config.urls),
+            return_exceptions=True,
+        )
+
+        first_error: BaseException | None = None
+        for result in results:
+            if isinstance(result, BaseException):
+                if first_error is None:
+                    first_error = result
+                continue
+            # The first server that took it answers, with its own view of the
+            # count — the only thing a single server can honestly report.
+            return result
+
+        assert first_error is not None
+        raise first_error
+
+    async def _read_from_one(self, request: proto.Request) -> Any:
+        """Read from the server that owns this value, falling back if it is down.
+
+        Tried in order rather than together: asking every server for the same
+        value would multiply the load to pick one answer, and the point of
+        picking by hash is that the same value always comes from the same place.
+        """
+        key = request.value or request.namespace
+        order = routing.order_for(self.config.urls, key)
+
+        first_error: Exception | None = None
+        for url in order:
+            try:
+                return await self._send_to(url, request)
+            except TransportError as exc:
+                # Unreachable: try the next. Any other answer is this server's
+                # real one and is not improved by asking someone else.
+                if first_error is None:
+                    first_error = exc
+                continue
+        assert first_error is not None
+        raise first_error
+
+    async def _send_to(
+        self, url: str, request: proto.Request, *, origin: str | None = None
+    ) -> Any:
         max_retries = self.config.max_retries
+        headers: dict[str, str] | None = None
+        if origin is not None:
+            headers = {
+                routing.ORIGIN_HEADER: origin,
+                routing.HOPS_HEADER: str(routing.DEFAULT_HOPS),
+            }
+
         for attempt in itertools.count():
             try:
                 response = await self._http.request(
                     request.method,
-                    request.path,
+                    f"{url}{request.path}",
                     params=request.params or None,
                     json=request.json,
+                    headers=headers,
                 )
             except httpx.HTTPError as exc:
                 if attempt < max_retries and proto.retry_after_exception(
@@ -226,7 +320,7 @@ class AsyncSightingDB:
                     await asyncio.sleep(proto.backoff(attempt))
                     continue
                 raise proto.transport_error(
-                    exc, request, f"{self.config.url}{request.path}"
+                    exc, request, f"{url}{request.path}"
                 ) from exc
 
             if attempt < max_retries and proto.retry_after_status(
