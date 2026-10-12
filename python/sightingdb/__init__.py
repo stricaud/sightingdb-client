@@ -46,6 +46,7 @@ from .models import (
     BulkWriteResult,
     Miss,
     ReadResult,
+    RecentWrite,
     ServerInfo,
     Sighting,
     WriteError,
@@ -66,6 +67,7 @@ __all__ = [
     "BulkWriteResult",
     "WriteError",
     "ServerInfo",
+    "RecentWrite",
     # errors
     "SightingDBError",
     "ConfigurationError",

@@ -7,7 +7,9 @@ These are skipped unless you point them at a server::
     SIGHTINGDB_TEST_VERIFY=false \
     pytest -m live
 
-Everything is written under ``_tests/`` and deleted again afterwards.
+Everything is written under ``tests/`` and deleted again afterwards — not
+``_tests/``: a namespace whose first segment starts with ``_`` is internal to
+the server and refuses writes from outside.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ if not URL:  # pragma: no cover - collection-time decision
 
 @pytest.fixture
 def namespace():
-    return f"_tests/client/{uuid.uuid4().hex[:12]}"
+    return f"tests/client/{uuid.uuid4().hex[:12]}"
 
 
 @pytest.fixture
@@ -96,7 +98,7 @@ def test_bulk_write_then_bulk_read(db, namespace):
             sightingdb.Sighting(namespace, "a", noshadow=True),
             sightingdb.Sighting(namespace, "b", noshadow=True),
             sightingdb.Sighting(namespace, "never-seen", noshadow=True),
-            sightingdb.Sighting("_tests/no/such/namespace", "x", noshadow=True),
+            sightingdb.Sighting("tests/no/such/namespace", "x", noshadow=True),
         ]
     )
     assert [r.found for r in found] == [True, True, False, False]
@@ -153,3 +155,20 @@ async def test_the_async_client_writes_and_reads(namespace):
             assert attribute.count == 1
         finally:
             await db.delete(namespace, missing_ok=True)
+
+
+def test_the_latest_writes_include_ours(db, namespace):
+    try:
+        db.latest(1)
+    except sightingdb.ProtocolError:
+        pytest.skip("this server predates /_api/latest (SightingDB 0.7.8)")
+
+    db.write(namespace, "first")
+    db.write(namespace, "second")
+    found = db.latest(10, namespace=namespace)
+    assert [w.value for w in found] == ["second", "first"]
+    assert all(w.namespace == namespace for w in found)
+
+    # Written again: back at the front, and listed once.
+    db.write(namespace, "first")
+    assert [w.value for w in db.latest(10, namespace=namespace)] == ["first", "second"]

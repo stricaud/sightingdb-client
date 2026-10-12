@@ -92,6 +92,46 @@ Namespaces are normalized for you: `feeds/ips`, `/feeds/ips` and `/feeds/ips/`
 are the same namespace here. To the server they are not — a trailing slash is a
 different namespace with its own counts.
 
+## What was written lately
+
+`latest()` lists the most recent writes, newest first, each with the namespace
+it went to. The server keeps one record and filters it **by the API key
+asking**: a key granted `r:feeds` sees writes under `feeds` and never learns
+that anything else was written.
+
+```python
+for write in db.latest(10):
+    print(write.written_at, write.namespace, write.value)
+
+db.latest(100, namespace="feeds")                        # one subtree
+db.latest(100, since=datetime.now(timezone.utc) - timedelta(hours=1))
+```
+
+A value written several times is listed once, at its latest write. `written`
+is when the write *arrived* at the server, not the sighting's own timestamp.
+At most 1000 come back per call, and the server remembers its last
+`latest_writes` (10000 by default) in all, shared between every key — a key
+that reads only a quiet namespace may see fewer than it asked for.
+
+`follow()` turns that into a stream: it polls and yields each new write once,
+oldest first, until you stop iterating.
+
+```python
+for write in db.follow(namespace="feeds", interval=5):
+    enrich(write.namespace, write.value)
+```
+
+Without `since=` it starts from whatever the server already holds at the first
+poll — the server's clock, not this machine's, so clock skew cannot make it
+miss writes. A value written again later is yielded again. A poll that falls
+more than 1000 writes behind skips the oldest of them, so poll more often (or
+narrow with `namespace=`) for a busy feed.
+
+Pointed at several servers, `latest()` asks all of them and merges the
+answers, so writes one missed while it was down still show. Needs SightingDB
+0.7.8 or later; an older server raises `ProtocolError`.
+`samples/latest.py` shows all of it against a running server.
+
 ## asyncio
 
 `AsyncSightingDB` is the same API, awaited:
@@ -107,6 +147,9 @@ async def main():
 
         results = await db.read_many([("feeds/misp/ips", v) for v in indicators])
         counts = await asyncio.gather(*(db.write("feeds/live", v) for v in values))
+
+        async for write in db.follow(namespace="feeds"):
+            print(write.namespace, write.value)
 
 asyncio.run(main())
 ```

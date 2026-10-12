@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import time
+from datetime import datetime
 from types import TracebackType
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -14,7 +15,14 @@ from . import _routing as routing
 from .__version__ import __version__
 from .config import Config
 from .errors import BulkWriteError, NotFoundError, SightingDBError, TransportError
-from .models import Attribute, BulkWriteResult, ReadResult, ServerInfo, Sighting
+from .models import (
+    Attribute,
+    BulkWriteResult,
+    ReadResult,
+    RecentWrite,
+    ServerInfo,
+    Sighting,
+)
 
 __all__ = ["SightingDB", "WriteBatch"]
 
@@ -294,6 +302,69 @@ class SightingDB:
         results = self.read_many([Sighting(namespace, value, noshadow=not shadow)])
         return bool(results and results[0].found)
 
+    # -- what was written lately -----------------------------------------
+
+    def latest(
+        self,
+        limit: int = 100,
+        *,
+        since: int | float | datetime | None = None,
+        namespace: str | None = None,
+    ) -> list[RecentWrite]:
+        """The values written most recently, newest first.
+
+        Only writes in namespaces this API key may read are listed: the server
+        keeps one record and filters it per key, so two keys asking the same
+        question get different answers. A value written again is listed once,
+        at its latest write.
+
+        Args:
+            limit: How many. The server returns at most 1000.
+            since: Only writes that arrived at or after this time — Unix
+                seconds or a :class:`~datetime.datetime`.
+            namespace: Only this namespace and those below it.
+
+        Pointed at several servers, every one is asked and the answers merged,
+        so writes one of them missed while it was down still show.
+
+        Needs SightingDB 0.7.8 or later; an older server raises
+        :class:`~sightingdb.ProtocolError`.
+        """
+        request = proto.latest(limit=limit, since=since, namespace=namespace)
+        if not self.fans_out:
+            return self._send(request)
+        return proto.merge_latest(self._read_from_all(request), limit)
+
+    def follow(
+        self,
+        *,
+        since: int | float | datetime | None = None,
+        namespace: str | None = None,
+        interval: float = 5.0,
+    ) -> Iterator[RecentWrite]:
+        """Yield writes as they arrive, oldest first, until you stop iterating.
+
+        Polls :meth:`latest` every ``interval`` seconds. Without ``since``,
+        only what arrives from here on is yielded — "here" being what the
+        server already holds at the first poll, so the clock on this machine
+        does not matter. Pass a time to start further back. A value written
+        again later is yielded again.
+
+        At most 1000 writes are fetched per poll, so a poll that falls further
+        behind than that skips the oldest of them; poll more often, or narrow
+        with ``namespace``, if the feed is that busy.
+
+            >>> for write in db.follow(namespace="feeds"):
+            ...     print(write.written_at, write.namespace, write.value)
+        """
+        follower = proto.Follower(since)
+        while True:
+            answer = self.latest(
+                proto.LATEST_MAX, since=follower.cursor, namespace=namespace
+            )
+            yield from follower.fresh(answer)
+            time.sleep(interval)
+
     # -- namespaces ------------------------------------------------------
 
     def delete(self, namespace: str, *, missing_ok: bool = False) -> None:
@@ -388,6 +459,25 @@ class SightingDB:
                 continue
         assert first_error is not None
         raise first_error
+
+    def _read_from_all(self, request: proto.Request) -> list[Any]:
+        """Ask every server, for a question no single one can answer alone.
+
+        A server that cannot be reached is left out rather than failing the
+        call; if none can be, the first failure is raised.
+        """
+        answers: list[Any] = []
+        first_error: Exception | None = None
+        for url in self.config.urls:
+            try:
+                answers.append(self._send_to(url, request))
+            except TransportError as exc:
+                if first_error is None:
+                    first_error = exc
+        if not answers:
+            assert first_error is not None
+            raise first_error
+        return answers
 
     def _origin(self) -> str:
         return self.config.node_id or routing.default_node_id()

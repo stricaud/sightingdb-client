@@ -13,7 +13,7 @@ import sys
 
 import sightingdb
 
-NAMESPACE = "_tests/samples/feed"
+NAMESPACE = "tests/samples/feed"
 
 FEED = [f"198.51.100.{n}" for n in range(50)]
 TO_ENRICH = ["198.51.100.7", "198.51.100.42", "203.0.113.1"]

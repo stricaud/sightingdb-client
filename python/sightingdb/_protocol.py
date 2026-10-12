@@ -20,6 +20,7 @@ from .models import (
     BulkWriteResult,
     Miss,
     ReadResult,
+    RecentWrite,
     ServerInfo,
     Sighting,
     _to_epoch,
@@ -168,6 +169,97 @@ def delete(namespace: str) -> Request:
 
 def info() -> Request:
     return Request("GET", "/i", decode=ServerInfo.from_json)
+
+
+#: The most one ``/_api/latest`` request returns. The server caps a larger
+#: ``limit`` rather than refusing it; capping here as well keeps a merge across
+#: several servers to what any one of them could have answered.
+LATEST_MAX = 1000
+
+
+def latest(
+    *, limit: int = 100, since: Any = None, namespace: str | None = None
+) -> Request:
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError(f"limit must be a positive integer, got {limit!r}")
+    params: dict[str, Any] = {"limit": min(limit, LATEST_MAX)}
+    if (epoch := _to_epoch(since)) is not None:
+        params["since"] = epoch
+    if namespace is not None:
+        params["namespace"] = normalize_namespace(namespace)
+    return Request(
+        "GET",
+        "/_api/latest",
+        params,
+        decode=lambda body: [RecentWrite.from_json(item) for item in body.get("items", ())],
+        namespace=params.get("namespace", ""),
+    )
+
+
+def merge_latest(answers: Iterable[list[RecentWrite]], limit: int) -> list[RecentWrite]:
+    """Fold several servers' latest writes into one list, newest first.
+
+    Servers a client fans out to each record the writes they took, so they
+    mostly agree — but one that was down for a while is missing what arrived
+    meanwhile, and asking only it would hide those writes. So every server is
+    asked, and a value listed by several is kept once, at its newest write.
+    """
+    newest: dict[tuple[str, str], RecentWrite] = {}
+    for answer in answers:
+        for entry in answer:
+            key = (entry.namespace, entry.value)
+            known = newest.get(key)
+            if known is None or entry.written > known.written:
+                newest[key] = entry
+    ordered = sorted(
+        newest.values(), key=lambda e: (e.written, e.namespace, e.value), reverse=True
+    )
+    return ordered[: min(limit, LATEST_MAX)]
+
+
+class Follower:
+    """The bookkeeping behind ``follow()``, shared by both clients.
+
+    Polling ``latest(since=...)`` has one trap: ``since`` is in whole seconds
+    and includes that second, so every poll returns again what arrived in the
+    second the previous one ended on. Those are remembered and skipped, and a
+    value written *again* in a later second is reported again — it is a new
+    write.
+    """
+
+    def __init__(self, since: Any) -> None:
+        self.cursor: int = _to_epoch(since) if since is not None else 0
+        self.at_cursor: set[tuple[str, str]] = set()
+        # Without a starting time, the first answer is the baseline: what is
+        # already there is the past, and only what follows it is reported.
+        # Taken from the server's own record rather than from this machine's
+        # clock, so a client whose clock runs ahead of the server's does not
+        # silently skip everything written "before" its idea of now.
+        self.baseline = since is None
+
+    def fresh(self, answer: list[RecentWrite]) -> list[RecentWrite]:
+        """What in this answer has not been reported yet, oldest first."""
+        if self.baseline:
+            self.baseline = False
+            self.fresh(answer)
+            return []
+        new: list[RecentWrite] = []
+        # The server lists newest first, and in arrival order within a second
+        # too, which a sort on whole seconds alone would lose: reversed first,
+        # then sorted stably, writes in the same second stay in the order they
+        # arrived.
+        for entry in sorted(reversed(answer), key=lambda e: e.written):
+            key = (entry.namespace, entry.value)
+            if entry.written < self.cursor:
+                continue
+            if entry.written == self.cursor and key in self.at_cursor:
+                continue
+            if entry.written > self.cursor:
+                self.cursor = entry.written
+                self.at_cursor = set()
+            self.at_cursor.add(key)
+            new.append(entry)
+        return new
 
 
 def _items_payload(sightings: Sequence[Sighting]) -> dict[str, Any]:

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 from types import TracebackType
-from typing import Any, Iterable
+from datetime import datetime
+from typing import Any, AsyncIterator, Iterable
 
 import httpx
 
@@ -14,7 +15,14 @@ from . import _routing as routing
 from ._client import USER_AGENT, _chunks
 from .config import Config
 from .errors import BulkWriteError, NotFoundError, SightingDBError, TransportError
-from .models import Attribute, BulkWriteResult, ReadResult, ServerInfo, Sighting
+from .models import (
+    Attribute,
+    BulkWriteResult,
+    ReadResult,
+    RecentWrite,
+    ServerInfo,
+    Sighting,
+)
 
 __all__ = ["AsyncSightingDB", "AsyncWriteBatch"]
 
@@ -197,6 +205,46 @@ class AsyncSightingDB:
         results = await self.read_many([Sighting(namespace, value, noshadow=not shadow)])
         return bool(results and results[0].found)
 
+    # -- what was written lately -----------------------------------------
+
+    async def latest(
+        self,
+        limit: int = 100,
+        *,
+        since: int | float | datetime | None = None,
+        namespace: str | None = None,
+    ) -> list[RecentWrite]:
+        """The values written most recently, newest first, as far as this key may see.
+
+        See :meth:`sightingdb.SightingDB.latest`. Pointed at several servers,
+        they are all asked at once and the answers merged.
+        """
+        request = proto.latest(limit=limit, since=since, namespace=namespace)
+        if not self.fans_out:
+            return await self._send(request)
+        return proto.merge_latest(await self._read_from_all(request), limit)
+
+    async def follow(
+        self,
+        *,
+        since: int | float | datetime | None = None,
+        namespace: str | None = None,
+        interval: float = 5.0,
+    ) -> AsyncIterator[RecentWrite]:
+        """Yield writes as they arrive, oldest first. See :meth:`sightingdb.SightingDB.follow`.
+
+            >>> async for write in db.follow(namespace="feeds"):
+            ...     print(write.written_at, write.namespace, write.value)
+        """
+        follower = proto.Follower(since)
+        while True:
+            answer = await self.latest(
+                proto.LATEST_MAX, since=follower.cursor, namespace=namespace
+            )
+            for entry in follower.fresh(answer):
+                yield entry
+            await asyncio.sleep(interval)
+
     # -- namespaces ------------------------------------------------------
 
     async def delete(self, namespace: str, *, missing_ok: bool = False) -> None:
@@ -292,6 +340,32 @@ class AsyncSightingDB:
                 continue
         assert first_error is not None
         raise first_error
+
+    async def _read_from_all(self, request: proto.Request) -> list[Any]:
+        """Ask every server at once, for a question no single one can answer alone.
+
+        An unreachable server is left out; if none can be reached, the first
+        failure is raised. Any other failure — a refused key, say — is raised
+        as it is, since asking the others would not make it right.
+        """
+        results = await asyncio.gather(
+            *(self._send_to(url, request) for url in self.config.urls),
+            return_exceptions=True,
+        )
+        answers: list[Any] = []
+        first_error: BaseException | None = None
+        for result in results:
+            if isinstance(result, TransportError):
+                if first_error is None:
+                    first_error = result
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            answers.append(result)
+        if not answers:
+            assert first_error is not None
+            raise first_error
+        return answers
 
     async def _send_to(
         self, url: str, request: proto.Request, *, origin: str | None = None

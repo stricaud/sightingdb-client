@@ -19,6 +19,7 @@ __all__ = [
     "WriteError",
     "BulkWriteResult",
     "ServerInfo",
+    "RecentWrite",
 ]
 
 
@@ -272,4 +273,37 @@ class ServerInfo:
             vendor=data.get("vendor", ""),
             author=data.get("author", ""),
             raw=dict(data),
+        )
+
+
+@dataclass(frozen=True, slots=True, order=False)
+class RecentWrite:
+    """A value written recently, and the namespace it went to.
+
+    What :meth:`~sightingdb.SightingDB.latest` returns. The server shows only
+    the writes in namespaces the API key may read, so two keys see different
+    lists.
+
+    Attributes:
+        namespace: Where it was written.
+        value: The value written.
+        written: Unix seconds when the write *arrived* at the server — not the
+            sighting's own timestamp, which a client may have set in the past.
+    """
+
+    namespace: str
+    value: str
+    written: int
+
+    @property
+    def written_at(self) -> datetime:
+        """:attr:`written` as a timezone-aware UTC datetime."""
+        return datetime.fromtimestamp(self.written, tz=timezone.utc)
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> RecentWrite:
+        return cls(
+            namespace=str(data.get("namespace", "")),
+            value=str(data.get("value", "")),
+            written=int(data.get("written", 0)),
         )

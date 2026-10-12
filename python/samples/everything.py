@@ -4,7 +4,7 @@
     SIGHTINGDB_APIKEY=changeme SIGHTINGDB_VERIFY=false ./samples/everything.py
 
 Settings come from the arguments below, then SIGHTINGDB_*, then
-~/.sightingdb/client.toml. Everything here is written under _tests/ and
+~/.sightingdb/client.toml. Everything here is written under tests/ and
 deleted again at the end.
 """
 
@@ -13,7 +13,7 @@ import sys
 
 import sightingdb
 
-NAMESPACE = "_tests/samples/ips"
+NAMESPACE = "tests/samples/ips"
 
 
 def main() -> int:
@@ -44,7 +44,7 @@ def main() -> int:
             [
                 (NAMESPACE, "8.8.8.8"),
                 sightingdb.Sighting(NAMESPACE, "1.1.1.1", ttl=86400),
-                {"namespace": "_tests/samples/domains", "value": "example.com"},
+                {"namespace": "tests/samples/domains", "value": "example.com"},
             ]
         )
         print(f"bulk write: {result.written} recorded")
@@ -75,7 +75,7 @@ def main() -> int:
                 sightingdb.Sighting(NAMESPACE, "127.0.0.1", noshadow=True),
                 sightingdb.Sighting(NAMESPACE, "192.168.0.2", noshadow=True),
                 sightingdb.Sighting(NAMESPACE, "never.seen.this", noshadow=True),
-                sightingdb.Sighting("_tests/no/such/namespace", "x", noshadow=True),
+                sightingdb.Sighting("tests/no/such/namespace", "x", noshadow=True),
             ]
         ):
             if result.found:
@@ -91,9 +91,14 @@ def main() -> int:
         # Everything in a namespace.
         print("namespace holds:", [a.value for a in db.list_values(NAMESPACE)])
 
+        # What was written lately, newest first — only in namespaces this key
+        # may read. See samples/latest.py for following writes as they arrive.
+        for write in db.latest(5, namespace="tests/samples"):
+            print(f"  latest: {write.namespace} {write.value} at {write.written_at:%H:%M:%S}")
+
         # And clean up after ourselves.
         db.delete(NAMESPACE, missing_ok=True)
-        db.delete("_tests/samples/domains", missing_ok=True)
+        db.delete("tests/samples/domains", missing_ok=True)
 
     return 0
 
